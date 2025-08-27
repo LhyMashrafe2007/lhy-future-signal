@@ -2,7 +2,7 @@ import os
 import json
 import time
 import requests
-import pandas as pd
+#import pandas as pd
 from datetime import datetime, time as dtime
 from flask import Flask, request, jsonify, render_template, send_from_directory
 
