@@ -1,174 +1,256 @@
+# FUTURE SIGNAL.py
 import os
-import json
 import time
 import requests
-#import pandas as pd
-from datetime import datetime, time as dtime
-from flask import Flask, request, jsonify, render_template, send_from_directory
+from datetime import datetime
+from flask import Flask, request, jsonify, render_template
 
 # ---------------------------
 # CONFIG
 # ---------------------------
-# আপনার Alpha Vantage API key .env/Environment Variable হিসেবে সেট করে দিন:
-# Linux/macOS উদাহরণ: export ALPHA_VANTAGE_KEY=EJFK7GKQO9DWXDS8
 ALPHA_KEY = os.getenv("ALPHA_VANTAGE_KEY", "EJFK7GKQO9DWXDS8")
 
-# ইন্ডিকেটর সেটিং (আপনি চাইলে টিউন করতে পারেন)
+# Indicator params (adjustable)
 EMA_SHORT = 20
 EMA_LONG  = 50
 RSI_LEN   = 14
 ATR_LEN   = 14
 
-# প্রতিদিন সর্বোচ্চ কতটি সিগন্যাল দেখাতে চান
 DAILY_SIGNAL_CAP = 10
+
+# Simple in-memory cache to reduce API calls (key: "BASE/QUOTE")
+CACHE = {}
+CACHE_TTL = 30  # seconds
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
 
+
 # ---------------------------
-# Helper Functions
+# Helpers - pure Python implementations
 # ---------------------------
 
-def rsi(series, period=14):
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(window=period, min_periods=period).mean()
-    avg_loss = loss.rolling(window=period, min_periods=period).mean()
-    rs = avg_gain / (avg_loss.replace(0, 1e-10))
-    return 100 - (100 / (1 + rs))
+def parse_time_string(s):
+    # AlphaVantage timestamps usually "YYYY-MM-DD HH:MM:SS"
+    try:
+        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        try:
+            # sometimes 'T' separator or timezone, try fromisoformat
+            return datetime.fromisoformat(s)
+        except Exception:
+            return None
 
-def atr(df, period=14):
-    # True Range
-    prev_close = df['close'].shift(1)
-    tr1 = df['high'] - df['low']
-    tr2 = (df['high'] - prev_close).abs()
-    tr3 = (df['low'] - prev_close).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    return tr.rolling(window=period, min_periods=period).mean()
+def fetch_fx_intraday_list(base, quote, interval="1min", outputsize="compact"):
+    """
+    Returns a list of candles sorted oldest->newest:
+    [ { 'time': datetime, 'open':float, 'high':float, 'low':float, 'close':float }, ... ]
+    """
+    key_cache = f"{base}/{quote}/{interval}"
+    now_ts = time.time()
+    if key_cache in CACHE and now_ts - CACHE[key_cache]['ts'] < CACHE_TTL:
+        return CACHE[key_cache]['data']
 
-def fetch_fx_intraday(base, quote, interval="1min", outputsize="compact"):
-    """
-    Alpha Vantage FX_INTRADAY থেকে 1-মিনিট ক্যান্ডল ডেটা আনে।
-    FX ডেটায় সাধারণত ভলিউম থাকে না; তাই আমরা OHLC নিয়েই কাজ করবো।
-    """
     url = (
         "https://www.alphavantage.co/query?"
         "function=FX_INTRADAY"
         f"&from_symbol={base}&to_symbol={quote}"
-        f"&interval={interval}"
-        f"&apikey={ALPHA_KEY}"
-        f"&outputsize={outputsize}"
+        f"&interval={interval}&outputsize={outputsize}&apikey={ALPHA_KEY}"
     )
-    resp = requests.get(url, timeout=30)
-    data = resp.json()
+    try:
+        resp = requests.get(url, timeout=25)
+        data = resp.json()
+    except Exception as e:
+        return None
+
     key = f"Time Series FX ({interval})"
     if key not in data:
-        # API limit বা invalid হলে graceful fallback
+        # sometimes response might contain error message or rate limit notice
         return None
 
     ts = data[key]
-    df = pd.DataFrame.from_dict(ts, orient="index")
-    # Alpha Vantage FX keys: '1. open', '2. high', '3. low', '4. close'
-    df = df.rename(columns={
-        '1. open': 'open',
-        '2. high': 'high',
-        '3. low' : 'low',
-        '4. close': 'close'
-    })
-    df = df.astype(float)
-    # Index to datetime (UTC-ish string)
-    df.index = pd.to_datetime(df.index)
-    df = df.sort_index()
-    return df
+    records = []
+    for tstr, vals in ts.items():
+        dt = parse_time_string(tstr)
+        if not dt:
+            continue
+        try:
+            o = float(vals.get("1. open"))
+            h = float(vals.get("2. high"))
+            l = float(vals.get("3. low"))
+            c = float(vals.get("4. close"))
+        except Exception:
+            continue
+        records.append({'time': dt, 'open': o, 'high': h, 'low': l, 'close': c})
 
-def compute_signals(df, base, quote):
+    # sort ascending (oldest -> newest)
+    records.sort(key=lambda x: x['time'])
+    # cache
+    CACHE[key_cache] = {'ts': now_ts, 'data': records}
+    return records
+
+
+def compute_ema_list(prices, span):
+    n = len(prices)
+    ema = [None] * n
+    if n < span:
+        return ema
+    # initial SMA
+    sma = sum(prices[:span]) / span
+    ema[span-1] = sma
+    k = 2.0 / (span + 1)
+    # compute subsequent
+    for i in range(span, n):
+        ema[i] = (prices[i] - ema[i-1]) * k + ema[i-1]
+    return ema
+
+
+def compute_rsi_list(prices, period=14):
+    n = len(prices)
+    rsi = [None] * n
+    if n < period + 1:
+        return rsi
+    gains = [0.0] * n
+    losses = [0.0] * n
+    for i in range(1, n):
+        diff = prices[i] - prices[i-1]
+        gains[i] = diff if diff > 0 else 0.0
+        losses[i] = -diff if diff < 0 else 0.0
+
+    # initial avg gain/loss
+    avg_gain = sum(gains[1:period+1]) / period
+    avg_loss = sum(losses[1:period+1]) / period
+    if avg_loss == 0:
+        rs = float('inf')
+    else:
+        rs = avg_gain / avg_loss
+    rsi[period] = 100 - (100 / (1 + rs))
+
+    for i in range(period + 1, n):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        rs = avg_gain / (avg_loss if avg_loss != 0 else 1e-10)
+        rsi[i] = 100 - (100 / (1 + rs))
+    return rsi
+
+
+def compute_atr_list(records, period=14):
+    # records is list of dicts with keys high, low, close
+    n = len(records)
+    if n < period + 1:
+        return [None] * n
+    tr = [None] * n
+    for i in range(1, n):
+        high = records[i]['high']
+        low = records[i]['low']
+        prev_close = records[i-1]['close']
+        tr[i] = max(high - low, abs(high - prev_close), abs(low - prev_close))
+
+    atr = [None] * n
+    # initial ATR is average of first `period` TR values (from 1..period)
+    initial_trs = [tr[i] for i in range(1, period+1) if tr[i] is not None]
+    if len(initial_trs) < period:
+        return atr
+    atr_val = sum(initial_trs) / period
+    atr[period] = atr_val
+    for i in range(period + 1, n):
+        atr_val = ( (atr_val * (period - 1)) + tr[i] ) / period
+        atr[i] = atr_val
+    return atr
+
+
+def compute_signals(records, base, quote):
     """
-    High-quality but conservative signals: EMA cross + RSI confirmation (+ ATR for SL/TP).
-    লক্ষ্য: ফাস্ট EMA/স্লো EMA ক্রসিং, RSI extremes দিয়ে ফিল্টার।
+    records: list of candle dicts sorted oldest->newest
+    returns list of signal dicts (time, pair, type, price, sl, tp, reason)
     """
-    if df is None or len(df) < max(EMA_LONG, RSI_LEN, ATR_LEN) + 5:
+    if not records or len(records) < max(EMA_LONG, RSI_LEN, ATR_LEN) + 5:
         return []
 
-    # Indicators
-    df['ema_s'] = df['close'].ewm(span=EMA_SHORT, adjust=False).mean()
-    df['ema_l'] = df['close'].ewm(span=EMA_LONG, adjust=False).mean()
-    df['rsi']   = rsi(df['close'], RSI_LEN)
-    df['atr']   = atr(df[['high','low','close']].copy(), ATR_LEN)
+    closes = [r['close'] for r in records]
+    highs = [r['high'] for r in records]
+    lows = [r['low'] for r in records]
 
-    # Shifted for cross detection
-    df['ema_s_prev'] = df['ema_s'].shift(1)
-    df['ema_l_prev'] = df['ema_l'].shift(1)
+    ema_s = compute_ema_list(closes, EMA_SHORT)
+    ema_l = compute_ema_list(closes, EMA_LONG)
+    rsi = compute_rsi_list(closes, RSI_LEN)
+    # build minimal structure for atr computation
+    recs_min = [{'high': highs[i], 'low': lows[i], 'close': closes[i]} for i in range(len(records))]
+    atr = compute_atr_list(recs_min, ATR_LEN)
 
     signals = []
-    # iterate from most recent to older to collect robust, fresh signals
-    for ts in df.index[::-1]:
-        row = df.loc[ts]
-        prev = df.shift(1).loc[ts]
-        # EMA golden/death cross detection
-        golden_cross = (row['ema_s'] > row['ema_l']) and (prev['ema_s'] <= prev['ema_l'])
-        death_cross  = (row['ema_s'] < row['ema_l']) and (prev['ema_s'] >= prev['ema_l'])
+    n = len(records)
+    # iterate from newest backward to find freshest signals
+    for i in range(n-1, 0, -1):
+        # need previous index for cross detection
+        if i-1 < 0:
+            continue
+        if ema_s[i] is None or ema_l[i] is None or ema_s[i-1] is None or ema_l[i-1] is None:
+            continue
+        # cross detection
+        golden_cross = (ema_s[i] > ema_l[i]) and (ema_s[i-1] <= ema_l[i-1])
+        death_cross  = (ema_s[i] < ema_l[i]) and (ema_s[i-1] >= ema_l[i-1])
 
-        # Confirmation filters (tight to reduce noise on 1-min)
-        # Buy: RSI < 35 এবং close > ema_l (trend bias)
-        # Sell: RSI > 65 এবং close < ema_l
-        # Extremely cautious: skip if ATR not ready
-        if pd.isna(row['atr']) or row['atr'] == 0:
+        # require rsi and atr present
+        if rsi[i] is None or atr[i] is None:
             continue
 
-        px = float(row['close'])
-        pip_buffer = float(row['atr'])  # ATR হিসেবে SL keep
-        # TP ≈ 1.25R
+        px = records[i]['close']
+        pip_buffer = atr[i]  # use ATR as buffer (approx)
         tp_buffer = 1.25 * pip_buffer
 
-        if golden_cross and (row['rsi'] < 35) and (row['close'] > row['ema_l']):
+        if golden_cross and (rsi[i] < 35) and (records[i]['close'] > ema_l[i]):
             signals.append({
-                "time": ts.strftime("%H:%M"),
+                "time": records[i]['time'].strftime("%H:%M"),
                 "pair": f"{base}/{quote}",
                 "type": "BUY",
                 "price": round(px, 6),
                 "sl": round(px - pip_buffer, 6),
                 "tp": round(px + tp_buffer, 6),
-                "reason": f"EMA{EMA_SHORT}>{EMA_LONG} cross + RSI({RSI_LEN})={round(row['rsi'],1)} < 35; trend above EMA_long"
+                "reason": f"EMA{EMA_SHORT}>{EMA_LONG} cross + RSI({RSI_LEN})={round(rsi[i],1)} < 35"
             })
 
-        if death_cross and (row['rsi'] > 65) and (row['close'] < row['ema_l']):
+        if death_cross and (rsi[i] > 65) and (records[i]['close'] < ema_l[i]):
             signals.append({
-                "time": ts.strftime("%H:%M"),
+                "time": records[i]['time'].strftime("%H:%M"),
                 "pair": f"{base}/{quote}",
                 "type": "SELL",
                 "price": round(px, 6),
                 "sl": round(px + pip_buffer, 6),
                 "tp": round(px - tp_buffer, 6),
-                "reason": f"EMA{EMA_SHORT}<{EMA_LONG} cross + RSI({RSI_LEN})={round(row['rsi'],1)} > 65; trend below EMA_long"
+                "reason": f"EMA{EMA_SHORT}<{EMA_LONG} cross + RSI({RSI_LEN})={round(rsi[i],1)} > 65"
             })
 
-        # stop if we already have enough per pair
+        # stop if enough per pair
         if len(signals) >= DAILY_SIGNAL_CAP:
             break
 
-    # reverse to chronological (oldest->newest)
+    # reverse chronological order (oldest->newest)
     signals.reverse()
     return signals
 
+
 def within_time_window(ts_hhmm, start_hhmm, end_hhmm):
-    """ts_hhmm, start_hhmm, end_hhmm are 'HH:MM' strings."""
-    to_time = lambda s: dtime(hour=int(s[:2]), minute=int(s[3:5]))
-    t  = to_time(ts_hhmm)
-    s  = to_time(start_hhmm) if start_hhmm else dtime(0,0)
-    e  = to_time(end_hhmm)   if end_hhmm   else dtime(23,59)
-    # সাধারণ window (same-day) ধরে নিয়েছি
+    from datetime import time as dtime
+    def to_time(s):
+        return dtime(hour=int(s[:2]), minute=int(s[3:5]))
+    t = None
+    try:
+        t = to_time(ts_hhmm)
+    except Exception:
+        return True
+    s = to_time(start_hhmm) if start_hhmm else dtime(0,0)
+    e = to_time(end_hhmm) if end_hhmm else dtime(23,59)
     return (t >= s) and (t <= e)
 
+
 def filter_signals(signals, start_time, end_time, direction):
-    # time window
     filtered = [s for s in signals if within_time_window(s["time"], start_time, end_time)]
-    # direction filter
     if direction == "CALL":
         filtered = [s for s in filtered if s["type"] == "BUY"]
     elif direction == "PUT":
         filtered = [s for s in filtered if s["type"] == "SELL"]
-    # লিমিট
     return filtered[:DAILY_SIGNAL_CAP]
+
 
 # ---------------------------
 # Routes
@@ -176,17 +258,11 @@ def filter_signals(signals, start_time, end_time, direction):
 
 @app.route("/")
 def index():
-    # templates/index.html রেন্ডার করবে
     return render_template("index.html")
 
+
 @app.route("/signals", methods=["POST"])
-def signals():
-    """
-    POST JSON: { pairs: ["EUR/USD","USD/JPY",...],
-                 startTime: "HH:MM",
-                 endTime: "HH:MM",
-                 signalDirection: "CALL"|"PUT"|"BOTH" }
-    """
+def signals_route():
     try:
         data = request.get_json(force=True)
         pairs = data.get("pairs", [])
@@ -195,31 +271,38 @@ def signals():
         direction = data.get("signalDirection", "BOTH")
 
         all_signals = []
-        # Alpha Vantage ফ্রি প্ল্যানে rate-limit আছে (প্রতি মিনিটে ৫টি কল)
-        # তাই pair গুলোতে একটু থ্রটলিং করতে চাইলে এখানে sleep রাখতে পারেন।
-        for i, pair in enumerate(pairs):
-            base, quote = pair.split("/")
-            df = fetch_fx_intraday(base, quote, interval="1min", outputsize="compact")
-            sigs = compute_signals(df, base, quote)
+
+        for idx, pair in enumerate(pairs):
+            try:
+                base, quote = pair.split("/")
+            except Exception:
+                continue
+            # fetch (with caching)
+            records = fetch_fx_intraday_list(base, quote, interval="1min", outputsize="compact")
+            if records is None or len(records) == 0:
+                # skip if no data
+                continue
+
+            sigs = compute_signals(records, base, quote)
             all_signals.extend(sigs)
 
-            # রেট-লিমিট ফ্রেন্ডলি (optional):
-            if i < len(pairs) - 1:
-                time.sleep(1)  # একটু দেরি
+            # be gentle with API (throttle)
+            if idx < len(pairs) - 1:
+                time.sleep(1)
 
-        # ফাইনাল ফিল্টারিং
+        # final filtering by time/direction & limit
         result = filter_signals(all_signals, start_time, end_time, direction)
-        # সর্বোচ্চ 10টি
         result = result[:DAILY_SIGNAL_CAP]
         return jsonify(result), 200
     except Exception as e:
+        # return error for frontend to show
         return jsonify({"error": str(e)}), 500
+
 
 # ---------------------------
 # Main
 # ---------------------------
 
 if __name__ == "__main__":
-    # ডেভেলপমেন্টে রান:
-    # export FLASK_ENV=development && python app.py
+    # Dev server
     app.run(host="0.0.0.0", port=5000, debug=True)
