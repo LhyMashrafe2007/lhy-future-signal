@@ -4,7 +4,9 @@ import time
 import requests
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template
-
+# --- Debug helper: capture last exception and make accessible temporarily ---
+import traceback
+from flask import abort
 # ---------------------------
 # CONFIG
 # ---------------------------
@@ -306,3 +308,30 @@ def signals_route():
 if __name__ == "__main__":
     # Dev server
     app.run(host="0.0.0.0", port=5000, debug=True)
+# Store last exception text
+app.config['LAST_EXCEPTION_TEXT'] = None
+
+@app.errorhandler(Exception)
+def handle_all_exceptions(e):
+    # Save full traceback to app config (for temporary debugging only)
+    app.config['LAST_EXCEPTION_TEXT'] = traceback.format_exc()
+    # Also print to stdout so Render logs will have it
+    print("=== FULL TRACEBACK (captured) ===")
+    print(app.config['LAST_EXCEPTION_TEXT'])
+    print("=== END TRACEBACK ===")
+    # Return minimal 500 (frontend still sees 500)
+    return "Internal server error (debug captured)", 500
+
+# Debug route to read last exception (protected by a token)
+DEBUG_TOKEN = os.getenv("DEV_DEBUG_TOKEN", "dev_debug_token_please_change")
+
+@app.route("/_last_error")
+def last_error():
+    token = request.args.get("token", "")
+    if token != DEBUG_TOKEN:
+        abort(403)
+    txt = app.config.get('LAST_EXCEPTION_TEXT')
+    if not txt:
+        return "No exception captured yet."
+    # Return as plain text
+    return "<pre style='white-space:pre-wrap; font-size:12px;'>%s</pre>" % (txt,)
