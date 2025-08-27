@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>ITX LHY FUTURE SIGNAL</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif; margin: 0; padding: 0;
+      background: #000; color: #fff; overflow: hidden;
+    }
+    body::before {
+      content: ""; position: fixed; top:0; left:0; width:100%; height:100%;
+      background: radial-gradient(circle at center, rgba(255,255,255,0.1) 0%, transparent 70%),
+                  radial-gradient(circle, #0ff 1px, transparent 1px),
+                  radial-gradient(circle, #0f0 1px, transparent 1px),
+                  radial-gradient(circle, #f0f 1px, transparent 1px);
+      background-size: 3px 3px, 150px 150px, 200px 200px, 100px 100px;
+      animation: galaxy 60s linear infinite; z-index:-1;
+    }
+    @keyframes galaxy {
+      0% { background-position: 0 0, 0 0, 0 0, 0 0; }
+      100% { background-position: 500px 1000px, 1000px 500px, -1000px -500px, -500px -1000px; }
+    }
+    .container {
+      max-width: 900px; margin: 20px auto; background: rgba(255,255,255,0.05);
+      padding: 20px; border-radius: 8px; box-shadow: 0 0 20px rgba(0,255,0,0.3);
+    }
+    h1 { text-align: center; color: #00ff00; }
+    label { font-weight: bold; margin-top: 10px; display: block; color: #0f0; }
+    input, select, button {
+      width: 100%; padding: 10px; margin: 5px 0 20px; border: 1px solid #0f0;
+      border-radius: 4px; background-color: #111; color: #0f0;
+    }
+    button { background-color: #00ff00; color: black; font-size: 16px; cursor: pointer; }
+    button:hover { background-color: #00cc00; }
+    .results {
+      margin-top: 20px; max-height: 360px; overflow-y: auto; border: 1px solid #0f0;
+      padding: 10px; background-color: #001100; border-radius: 4px;
+    }
+    .signal {
+      background: #003300; border: 1px solid #0f0; padding: 10px; margin-bottom: 10px;
+      border-radius: 4px; color: #0f0; line-height: 1.4;
+      display: grid; grid-template-columns: 110px 130px 70px 1fr; gap: 6px;
+    }
+    .muted { color: #9cff9c; font-size: 12px; }
+    #botSection { display: none; }
+    .error { color: red; font-size: 14px; margin-top: -10px; margin-bottom: 10px; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    @media (max-width: 700px) { .row { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>ITX LHY FUTURE SIGNAL</h1>
+
+    <!-- Login Section -->
+    <div id="loginSection">
+      <label for="licenseKey">Enter Password (keep blank on page load, you will type it):</label>
+      <input type="password" id="licenseKey" placeholder="********" required />
+      <button onclick="checkLicense()">Login</button>
+      <div class="error" id="errorMsg"></div>
+    </div>
+
+    <!-- Bot Section -->
+    <div id="botSection">
+      <div class="row">
+        <div>
+          <label for="numSignals">Number of Signals (max 10):</label>
+          <input type="number" id="numSignals" placeholder="10" value="10" min="1" max="10" required />
+        </div>
+        <div>
+          <label for="signalDirection">Signal Direction:</label>
+          <select id="signalDirection" required>
+            <option value="BOTH">BOTH</option>
+            <option value="CALL">CALL</option>
+            <option value="PUT">PUT</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="row">
+        <div>
+          <label for="startTime">Start Time (HH:MM):</label>
+          <input type="time" id="startTime" />
+        </div>
+        <div>
+          <label for="endTime">End Time (HH:MM):</label>
+          <input type="time" id="endTime" />
+        </div>
+      </div>
+
+      <label for="pairs">Select Forex Pairs (no OTC):</label>
+      <select id="pairs" multiple size="12" required>
+        <option value="EUR/USD">EUR/USD</option>
+        <option value="GBP/USD">GBP/USD</option>
+        <option value="USD/JPY">USD/JPY</option>
+        <option value="AUD/USD">AUD/USD</option>
+        <option value="USD/CAD">USD/CAD</option>
+        <option value="NZD/USD">NZD/USD</option>
+        <option value="EUR/JPY">EUR/JPY</option>
+        <option value="GBP/JPY">GBP/JPY</option>
+        <option value="EUR/GBP">EUR/GBP</option>
+        <option value="EUR/CHF">EUR/CHF</option>
+        <option value="USD/CHF">USD/CHF</option>
+        <option value="EUR/AUD">EUR/AUD</option>
+        <option value="GBP/AUD">GBP/AUD</option>
+        <option value="AUD/JPY">AUD/JPY</option>
+        <option value="AUD/CHF">AUD/CHF</option>
+        <option value="NZD/JPY">NZD/JPY</option>
+        <option value="NZD/CHF">NZD/CHF</option>
+        <option value="CAD/JPY">CAD/JPY</option>
+        <option value="CAD/CHF">CAD/CHF</option>
+        <option value="EUR/CAD">EUR/CAD</option>
+        <option value="GBP/CAD">GBP/CAD</option>
+        <option value="CHF/JPY">CHF/JPY</option>
+      </select>
+
+      <button type="button" onclick="generateSignals()">Generate Signals</button>
+
+      <div class="results" id="results"></div>
+      <div class="muted">* TP/SL ATR-ভিত্তিক; 1-মিনিট ডেটায় শব্দ কমাতে কড়া ফিল্টার প্রয়োগ করা হয়েছে।</div>
+    </div>
+  </div>
+
+  <script>
+    function checkLicense() {
+      const license = document.getElementById('licenseKey').value.trim();
+      const errorMsg = document.getElementById('errorMsg');
+      // পাসওয়ার্ড: "Lhy Trader V4"
+      if (license === "Lhy Trader V4") {
+        document.getElementById('loginSection').style.display = "none";
+        document.getElementById('botSection').style.display = "block";
+      } else {
+        errorMsg.textContent = "Invalid Password!";
+      }
+    }
+
+    function generateSignals() {
+      const numSignals = Math.min(parseInt(document.getElementById('numSignals').value || "10", 10), 10);
+      const startTime = document.getElementById('startTime').value || "";
+      const endTime   = document.getElementById('endTime').value || "";
+      const direction = document.getElementById('signalDirection').value;
+      const pairs = Array.from(document.getElementById('pairs').selectedOptions).map(opt => opt.value);
+
+      if (pairs.length === 0) {
+        alert("কমপক্ষে একটি পেয়ার সিলেক্ট করুন।");
+        return;
+      }
+
+      const resultsDiv = document.getElementById('results');
+      resultsDiv.innerHTML = "Loading...";
+
+      fetch('/signals', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pairs, startTime, endTime, signalDirection: direction })
+      })
+      .then(res => res.json())
+      .then(data => {
+        resultsDiv.innerHTML = '';
+        let signals = Array.isArray(data) ? data : [];
+        // ইউজারের চাওয়া সংখ্যায় ক্যাপ করুন
+        signals = signals.slice(0, numSignals);
+
+        if (signals.length === 0) {
+          const div = document.createElement("div");
+          div.className = "signal";
+          div.textContent = "No signals matched filters. Try widening the time window or choose other pairs.";
+          resultsDiv.appendChild(div);
+          return;
+        }
+
+        signals.forEach(sig => {
+          const box = document.createElement("div");
+          box.className = "signal";
+          box.innerHTML = `
+            <div><b>Time:</b> ${sig.time}</div>
+            <div><b>Pair:</b> ${sig.pair}</div>
+            <div><b>Type:</b> ${sig.type}</div>
+            <div>
+              <div><b>Price:</b> ${sig.price}</div>
+              <div><b>SL:</b> ${sig.sl} &nbsp; <b>TP:</b> ${sig.tp}</div>
+              <div class="muted">${sig.reason || ""}</div>
+            </div>
+          `;
+          resultsDiv.appendChild(box);
+        });
+      })
+      .catch(err => {
+        resultsDiv.innerHTML = '';
+        const div = document.createElement("div");
+        div.className = "signal";
+        div.textContent = "Error: " + (err?.message || err);
+        resultsDiv.appendChild(div);
+      });
+    }
+  </script>
+</body>
+</html>
