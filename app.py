@@ -154,53 +154,35 @@ def compute_signals(records, base, quote):
         return []
 
     closes = [r['close'] for r in records]
-    highs = [r['high'] for r in records]
-    lows = [r['low'] for r in records]
-
     ema_s = compute_ema_list(closes, EMA_SHORT)
     ema_l = compute_ema_list(closes, EMA_LONG)
-    rsi = compute_rsi_list(closes, RSI_LEN)
-    recs_min = [{'high': highs[i], 'low': lows[i], 'close': closes[i]} for i in range(len(records))]
-    atr = compute_atr_list(recs_min, ATR_LEN)
 
     signals = []
     n = len(records)
     for i in range(n-1, 0, -1):
-        if i-1 < 0:
-            continue
         if ema_s[i] is None or ema_l[i] is None or ema_s[i-1] is None or ema_l[i-1] is None:
             continue
 
         golden_cross = (ema_s[i] > ema_l[i]) and (ema_s[i-1] <= ema_l[i-1])
         death_cross  = (ema_s[i] < ema_l[i]) and (ema_s[i-1] >= ema_l[i-1])
 
-        if rsi[i] is None or atr[i] is None:
-            continue
-
         px = records[i]['close']
-        pip_buffer = atr[i]
-        tp_buffer = 1.25 * pip_buffer
-
-        if golden_cross and (rsi[i] < 35) and (records[i]['close'] > ema_l[i]):
+        if golden_cross:
             signals.append({
                 "time": records[i]['time'].strftime("%H:%M"),
                 "pair": f"{base}/{quote}",
                 "type": "BUY",
                 "price": round(px, 6),
-                "sl": round(px - pip_buffer, 6),
-                "tp": round(px + tp_buffer, 6),
-                "reason": f"EMA{EMA_SHORT}>{EMA_LONG} cross + RSI({RSI_LEN})={round(rsi[i],1)} < 35"
+                "reason": f"EMA{EMA_SHORT}>{EMA_LONG} cross"
             })
 
-        if death_cross and (rsi[i] > 65) and (records[i]['close'] < ema_l[i]):
+        if death_cross:
             signals.append({
                 "time": records[i]['time'].strftime("%H:%M"),
                 "pair": f"{base}/{quote}",
                 "type": "SELL",
                 "price": round(px, 6),
-                "sl": round(px + pip_buffer, 6),
-                "tp": round(px - tp_buffer, 6),
-                "reason": f"EMA{EMA_SHORT}<{EMA_LONG} cross + RSI({RSI_LEN})={round(rsi[i],1)} > 65"
+                "reason": f"EMA{EMA_SHORT}<{EMA_LONG} cross"
             })
 
         if len(signals) >= DAILY_SIGNAL_CAP:
@@ -208,6 +190,7 @@ def compute_signals(records, base, quote):
 
     signals.reverse()
     return signals
+
 
 
 def within_time_window(ts_hhmm, start_hhmm, end_hhmm):
