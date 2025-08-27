@@ -1,18 +1,16 @@
-# FUTURE SIGNAL.py
+# app.py
 import os
 import time
 import requests
-from datetime import datetime
-from flask import Flask, request, jsonify, render_template
-# --- Debug helper: capture last exception and make accessible temporarily ---
 import traceback
-from flask import abort
+from datetime import datetime
+from flask import Flask, request, jsonify, render_template, send_from_directory, abort
+
 # ---------------------------
 # CONFIG
 # ---------------------------
 ALPHA_KEY = os.getenv("ALPHA_VANTAGE_KEY", "EJFK7GKQO9DWXDS8")
 
-# Indicator params (adjustable)
 EMA_SHORT = 20
 EMA_LONG  = 50
 RSI_LEN   = 14
@@ -20,33 +18,35 @@ ATR_LEN   = 14
 
 DAILY_SIGNAL_CAP = 10
 
-# Simple in-memory cache to reduce API calls (key: "BASE/QUOTE")
+# cache
 CACHE = {}
 CACHE_TTL = 30  # seconds
 
-app = Flask(__name__, template_folder="templates", static_folder="static")
+# base dir + Flask app with absolute template/static paths
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
+STATIC_DIR = os.path.join(BASE_DIR, "static")
 
+app = Flask(
+    __name__,
+    template_folder=TEMPLATES_DIR,
+    static_folder=STATIC_DIR
+)
 
 # ---------------------------
 # Helpers - pure Python implementations
 # ---------------------------
 
 def parse_time_string(s):
-    # AlphaVantage timestamps usually "YYYY-MM-DD HH:MM:SS"
     try:
         return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
     except Exception:
         try:
-            # sometimes 'T' separator or timezone, try fromisoformat
             return datetime.fromisoformat(s)
         except Exception:
             return None
 
 def fetch_fx_intraday_list(base, quote, interval="1min", outputsize="compact"):
-    """
-    Returns a list of candles sorted oldest->newest:
-    [ { 'time': datetime, 'open':float, 'high':float, 'low':float, 'close':float }, ... ]
-    """
     key_cache = f"{base}/{quote}/{interval}"
     now_ts = time.time()
     if key_cache in CACHE and now_ts - CACHE[key_cache]['ts'] < CACHE_TTL:
@@ -61,12 +61,11 @@ def fetch_fx_intraday_list(base, quote, interval="1min", outputsize="compact"):
     try:
         resp = requests.get(url, timeout=25)
         data = resp.json()
-    except Exception as e:
+    except Exception:
         return None
 
     key = f"Time Series FX ({interval})"
     if key not in data:
-        # sometimes response might contain error message or rate limit notice
         return None
 
     ts = data[key]
@@ -84,9 +83,7 @@ def fetch_fx_intraday_list(base, quote, interval="1min", outputsize="compact"):
             continue
         records.append({'time': dt, 'open': o, 'high': h, 'low': l, 'close': c})
 
-    # sort ascending (oldest -> newest)
     records.sort(key=lambda x: x['time'])
-    # cache
     CACHE[key_cache] = {'ts': now_ts, 'data': records}
     return records
 
@@ -96,11 +93,9 @@ def compute_ema_list(prices, span):
     ema = [None] * n
     if n < span:
         return ema
-    # initial SMA
     sma = sum(prices[:span]) / span
     ema[span-1] = sma
     k = 2.0 / (span + 1)
-    # compute subsequent
     for i in range(span, n):
         ema[i] = (prices[i] - ema[i-1]) * k + ema[i-1]
     return ema
@@ -118,13 +113,9 @@ def compute_rsi_list(prices, period=14):
         gains[i] = diff if diff > 0 else 0.0
         losses[i] = -diff if diff < 0 else 0.0
 
-    # initial avg gain/loss
     avg_gain = sum(gains[1:period+1]) / period
     avg_loss = sum(losses[1:period+1]) / period
-    if avg_loss == 0:
-        rs = float('inf')
-    else:
-        rs = avg_gain / avg_loss
+    rs = float('inf') if avg_loss == 0 else (avg_gain / avg_loss)
     rsi[period] = 100 - (100 / (1 + rs))
 
     for i in range(period + 1, n):
@@ -136,7 +127,6 @@ def compute_rsi_list(prices, period=14):
 
 
 def compute_atr_list(records, period=14):
-    # records is list of dicts with keys high, low, close
     n = len(records)
     if n < period + 1:
         return [None] * n
@@ -148,23 +138,18 @@ def compute_atr_list(records, period=14):
         tr[i] = max(high - low, abs(high - prev_close), abs(low - prev_close))
 
     atr = [None] * n
-    # initial ATR is average of first `period` TR values (from 1..period)
     initial_trs = [tr[i] for i in range(1, period+1) if tr[i] is not None]
     if len(initial_trs) < period:
         return atr
     atr_val = sum(initial_trs) / period
     atr[period] = atr_val
     for i in range(period + 1, n):
-        atr_val = ( (atr_val * (period - 1)) + tr[i] ) / period
+        atr_val = ((atr_val * (period - 1)) + tr[i]) / period
         atr[i] = atr_val
     return atr
 
 
 def compute_signals(records, base, quote):
-    """
-    records: list of candle dicts sorted oldest->newest
-    returns list of signal dicts (time, pair, type, price, sl, tp, reason)
-    """
     if not records or len(records) < max(EMA_LONG, RSI_LEN, ATR_LEN) + 5:
         return []
 
@@ -175,29 +160,25 @@ def compute_signals(records, base, quote):
     ema_s = compute_ema_list(closes, EMA_SHORT)
     ema_l = compute_ema_list(closes, EMA_LONG)
     rsi = compute_rsi_list(closes, RSI_LEN)
-    # build minimal structure for atr computation
     recs_min = [{'high': highs[i], 'low': lows[i], 'close': closes[i]} for i in range(len(records))]
     atr = compute_atr_list(recs_min, ATR_LEN)
 
     signals = []
     n = len(records)
-    # iterate from newest backward to find freshest signals
     for i in range(n-1, 0, -1):
-        # need previous index for cross detection
         if i-1 < 0:
             continue
         if ema_s[i] is None or ema_l[i] is None or ema_s[i-1] is None or ema_l[i-1] is None:
             continue
-        # cross detection
+
         golden_cross = (ema_s[i] > ema_l[i]) and (ema_s[i-1] <= ema_l[i-1])
         death_cross  = (ema_s[i] < ema_l[i]) and (ema_s[i-1] >= ema_l[i-1])
 
-        # require rsi and atr present
         if rsi[i] is None or atr[i] is None:
             continue
 
         px = records[i]['close']
-        pip_buffer = atr[i]  # use ATR as buffer (approx)
+        pip_buffer = atr[i]
         tp_buffer = 1.25 * pip_buffer
 
         if golden_cross and (rsi[i] < 35) and (records[i]['close'] > ema_l[i]):
@@ -222,11 +203,9 @@ def compute_signals(records, base, quote):
                 "reason": f"EMA{EMA_SHORT}<{EMA_LONG} cross + RSI({RSI_LEN})={round(rsi[i],1)} > 65"
             })
 
-        # stop if enough per pair
         if len(signals) >= DAILY_SIGNAL_CAP:
             break
 
-    # reverse chronological order (oldest->newest)
     signals.reverse()
     return signals
 
@@ -235,7 +214,6 @@ def within_time_window(ts_hhmm, start_hhmm, end_hhmm):
     from datetime import time as dtime
     def to_time(s):
         return dtime(hour=int(s[:2]), minute=int(s[3:5]))
-    t = None
     try:
         t = to_time(ts_hhmm)
     except Exception:
@@ -260,6 +238,7 @@ def filter_signals(signals, start_time, end_time, direction):
 
 @app.route("/")
 def index():
+    # render_template will use the absolute template_folder set above
     return render_template("index.html")
 
 
@@ -279,50 +258,42 @@ def signals_route():
                 base, quote = pair.split("/")
             except Exception:
                 continue
-            # fetch (with caching)
+
             records = fetch_fx_intraday_list(base, quote, interval="1min", outputsize="compact")
-            if records is None or len(records) == 0:
-                # skip if no data
+            if not records:
                 continue
 
             sigs = compute_signals(records, base, quote)
             all_signals.extend(sigs)
 
-            # be gentle with API (throttle)
             if idx < len(pairs) - 1:
                 time.sleep(1)
 
-        # final filtering by time/direction & limit
         result = filter_signals(all_signals, start_time, end_time, direction)
         result = result[:DAILY_SIGNAL_CAP]
         return jsonify(result), 200
     except Exception as e:
-        # return error for frontend to show
+        # log full traceback
+        print("Exception in /signals:", traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 
 
 # ---------------------------
-# Main
+# Debug & utility routes (protected)
 # ---------------------------
 
-if __name__ == "__main__":
-    # Dev server
-    app.run(host="0.0.0.0", port=5000, debug=True)
-# Store last exception text
+# store last exception text (updated by error handler)
 app.config['LAST_EXCEPTION_TEXT'] = None
 
 @app.errorhandler(Exception)
 def handle_all_exceptions(e):
-    # Save full traceback to app config (for temporary debugging only)
     app.config['LAST_EXCEPTION_TEXT'] = traceback.format_exc()
-    # Also print to stdout so Render logs will have it
     print("=== FULL TRACEBACK (captured) ===")
     print(app.config['LAST_EXCEPTION_TEXT'])
     print("=== END TRACEBACK ===")
-    # Return minimal 500 (frontend still sees 500)
     return "Internal server error (debug captured)", 500
 
-# Debug route to read last exception (protected by a token)
+# protected token for debug access (set via ENV in Render)
 DEBUG_TOKEN = os.getenv("DEV_DEBUG_TOKEN", "dev_debug_token_please_change")
 
 @app.route("/_last_error")
@@ -333,5 +304,46 @@ def last_error():
     txt = app.config.get('LAST_EXCEPTION_TEXT')
     if not txt:
         return "No exception captured yet."
-    # Return as plain text
     return "<pre style='white-space:pre-wrap; font-size:12px;'>%s</pre>" % (txt,)
+
+@app.route("/_ls")
+def _list_templates():
+    base = app.root_path
+    tpl_dir = os.path.join(base, "templates")
+    out = {"app_root": base, "templates_path": tpl_dir, "exists": os.path.isdir(tpl_dir), "files": []}
+    if os.path.isdir(tpl_dir):
+        try:
+            names = sorted(os.listdir(tpl_dir))
+            out["files"] = names
+        except Exception as e:
+            out["error_listdir"] = str(e)
+    print("===== TEMPLATES DEBUG =====")
+    print(out)
+    print("===== END TEMPLATES DEBUG =====")
+    html = "<h3>Templates debug</h3>"
+    html += f"<p>App root: <code>{out['app_root']}</code></p>"
+    html += f"<p>Templates dir exists: {out['exists']}</p>"
+    html += "<ul>"
+    for f in out["files"]:
+        html += f"<li>{f}</li>"
+    html += "</ul>"
+    if "error_listdir" in out:
+        html += f"<pre>{out['error_listdir']}</pre>"
+    return html
+
+@app.route("/test_index")
+def test_index():
+    # direct send file (bypasses Jinja) to confirm file presence
+    path = os.path.join(TEMPLATES_DIR, "index.html")
+    if os.path.isfile(path):
+        return send_from_directory(TEMPLATES_DIR, "index.html")
+    return f"index.html NOT FOUND at {path}", 404
+
+
+# ---------------------------
+# Main
+# ---------------------------
+
+if __name__ == "__main__":
+    # Development server
+    app.run(host="0.0.0.0", port=5000, debug=True)
