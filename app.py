@@ -322,7 +322,7 @@ def _list_templates():
     print("===== END TEMPLATES DEBUG =====")
     html = "<h3>Templates debug</h3>"
     html += f"<p>App root: <code>{out['app_root']}</code></p>"
-    html += f"<p>Templates dir exists: {out['exists']}</p>"
+    html += f"<p>Templates dir exists: {out['exists']}</code></p>"
     html += "<ul>"
     for f in out["files"]:
         html += f"<li>{f}</li>"
